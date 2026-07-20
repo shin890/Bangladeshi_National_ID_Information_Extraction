@@ -1,0 +1,421 @@
+import os
+import io
+import json
+import logging
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+
+import easyocr
+import numpy as np
+from PIL import Image
+from pydantic import BaseModel, Field
+
+# Upgraded to google-genai
+from google import genai
+from google.genai import types, errors
+from dotenv import load_dotenv
+
+from fastapi import FastAPI, File, UploadFile, Header, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+
+# Load environment variables
+load_dotenv()
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("nid-backend")
+
+app = FastAPI(title="Bangladeshi NID Information Extraction API")
+
+# Enable CORS for frontend integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global variables
+DATA_DIR = "data"
+DB_FILE = os.path.join(DATA_DIR, "processed_nids.json")
+ocr_reader = None
+
+# Ensure data directory exists
+os.makedirs(DATA_DIR, exist_ok=True)
+if not os.path.exists(DB_FILE):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump([], f, ensure_ascii=False, indent=4)
+
+# Pydantic schema for Gemini output
+class NIDDetails(BaseModel):
+    name: str = Field(description="The English name printed on the NID directly. Keep exactly as printed.")
+    fatherName: str = Field(description="English transliterated father's name from Bangla")
+    motherName: str = Field(description="English transliterated mother's name from Bangla")
+    dateOfBirth: str = Field(description="Date of birth in YYYY-MM-DD format")
+    nidNumber: str = Field(description="National ID number (digits only, remove all spaces/hyphens)")
+    presentAddress: str = Field(description="English transliterated present address from Bangla (labeled 'Present Address' / বর্তমান ঠিকানা)")
+    permanentAddress: str = Field(description="English transliterated permanent address from Bangla. Sourced from a field labeled 'Permanent Address'/স্থায়ী ঠিকানা if present; many NID cards instead print 'Place of Birth'/জন্মস্থান, which should be used here in that case. Must NEVER be a copy of presentAddress — if no distinct source text exists, return an empty string.")
+
+# Response schema
+class ExtractionResponse(BaseModel):
+    data: NIDDetails
+    already_processed: bool
+    existing_data: Optional[NIDDetails] = None
+    front_raw_text: str
+    back_raw_text: str
+    message: str
+    warnings: List[str] = Field(default_factory=list)
+
+
+class UpdateRequest(BaseModel):
+    nidNumber: str = Field(description="NID number of the existing record to update (used to locate it)")
+    updatedData: NIDDetails = Field(description="The new data to overwrite the existing record with")
+
+
+class UpdateResponse(BaseModel):
+    message: str
+    data: NIDDetails
+
+class UnreadableImageError(Exception):
+    """Raised when an image can't be decoded, or OCR extracts no usable text from it."""
+
+
+SUPPORTED_CONTENT_TYPES = {"image/jpeg", "image/jpg", "image/png"}
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+
+
+def validate_image_format(file: UploadFile, label: str) -> None:
+    """
+    Enforce the supported input formats: JPG, JPEG, PNG.
+    """
+    content_type_ok = (file.content_type or "").lower() in SUPPORTED_CONTENT_TYPES
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    ext_ok = ext in SUPPORTED_EXTENSIONS
+
+    if not (content_type_ok or ext_ok):
+        ext_display = f", extension '{ext}'" if ext else ""
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"{label} image: unsupported file format "
+                f"(content-type '{file.content_type or 'unknown'}'{ext_display}). "
+                f"Supported formats: JPG, JPEG, PNG."
+            )
+        )
+
+
+def get_ocr_reader():
+    """Lazy load EasyOCR reader to save memory and startup time."""
+    global ocr_reader
+    if ocr_reader is None:
+        logger.info("Initializing EasyOCR reader for Bangla and English...")
+        ocr_reader = easyocr.Reader(["bn", "en"])
+        logger.info("EasyOCR initialized successfully.")
+    return ocr_reader
+
+def run_easy_ocr(image_bytes: bytes) -> str:
+    """
+    Run OCR on the image bytes using EasyOCR and return raw text.
+    """
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        image.verify()  
+    except Exception as e:
+        raise UnreadableImageError(f"Could not decode image: {str(e)}")
+
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        img_np = np.array(image)
+        reader = get_ocr_reader()
+        results = reader.readtext(img_np, detail=0)
+    except UnreadableImageError:
+        raise
+    except Exception as e:
+        logger.error(f"Error during OCR: {str(e)}")
+        raise UnreadableImageError(f"OCR processing failed: {str(e)}")
+
+    text = "\n".join(results).strip()
+    if not text:
+        raise UnreadableImageError("No readable text was found in the image.")
+    return text
+
+def load_db() -> List[Dict[str, Any]]:
+    """Load processed NIDs database."""
+    try:
+        if not os.path.exists(DB_FILE):
+            return []
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Error reading DB: {str(e)}")
+        return []
+
+def save_to_db(record: Dict[str, Any]):
+    """Save a processed NID to the database."""
+    try:
+        db = load_db()
+        record_to_save = record.copy()
+        record_to_save["processedAt"] = datetime.now().isoformat()
+        db.append(record_to_save)
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=4)
+        logger.info(f"Successfully saved record for {record.get('name', 'Unknown')} to DB.")
+    except Exception as e:
+        logger.error(f"Error saving to DB: {str(e)}")
+
+def check_duplicate(nid_number: str) -> Optional[Dict[str, Any]]:
+    """Check if the NID combination is already in the database based strictly on NID Number."""
+    db = load_db()
+    clean_nid = nid_number.strip()
+    for record in db:
+        rec_nid = str(record.get("nidNumber", "")).strip()
+        if rec_nid == clean_nid:
+            return record
+    return None
+
+def update_record(nid_number: str, new_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Overwrite an existing record (matched strictly by NID number) with new_data.
+    """
+    db = load_db()
+    clean_nid = nid_number.strip()
+    for i, record in enumerate(db):
+        rec_nid = str(record.get("nidNumber", "")).strip()
+        if rec_nid == clean_nid:
+            updated_record = new_data.copy()
+            updated_record["processedAt"] = record.get("processedAt", datetime.now().isoformat())
+            updated_record["updatedAt"] = datetime.now().isoformat()
+            db[i] = updated_record
+            with open(DB_FILE, "w", encoding="utf-8") as f:
+                json.dump(db, f, ensure_ascii=False, indent=4)
+            logger.info(f"Successfully updated record for NID: {nid_number}.")
+            return updated_record
+    raise ValueError(f"No existing record found for NID '{nid_number}' to update.")
+
+@app.get("/api/history", response_model=List[Dict[str, Any]])
+def get_history():
+    """Retrieve history of processed NIDs."""
+    return load_db()
+
+@app.post("/api/update", response_model=UpdateResponse)
+def update_nid_record(payload: UpdateRequest):
+    """
+    Overwrite an existing DB record with newly extracted data.
+    """
+    try:
+        # FIX: Matches the streamlined signature using solely nidNumber 
+        updated = update_record(payload.nidNumber, payload.updatedData.model_dump())
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    return UpdateResponse(message="Record updated successfully.", data=NIDDetails(**updated))
+
+@app.post("/api/extract", response_model=ExtractionResponse)
+async def extract_nid_info(
+    front_image: UploadFile = File(None),
+    back_image: UploadFile = File(None),
+    x_gemini_api_key: Optional[str] = Header(None)
+):
+    if not front_image or not back_image:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Both Front and Back NID images are required."
+        )
+
+    validate_image_format(front_image, "Front")
+    validate_image_format(back_image, "Back")
+
+    # Resolve Gemini API Key
+    api_key = x_gemini_api_key or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Gemini API Key is missing. Please provide it in the X-Gemini-API-Key header or configure GEMINI_API_KEY on the server."
+        )
+
+    try:
+        front_bytes = await front_image.read()
+        back_bytes = await back_image.read()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Error reading uploaded images: {str(e)}"
+        )
+
+    warnings: List[str] = []
+
+    # --- Front OCR: Required
+    logger.info("Running OCR on Front image...")
+    try:
+        front_text = run_easy_ocr(front_bytes)
+    except UnreadableImageError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"Front image is unreadable ({str(e)}). Please provide a clear, well-lit photo of the NID front."
+        )
+
+    # --- Back OCR: Optional
+    logger.info("Running OCR on Back image...")
+    back_text = ""
+    try:
+        back_text = run_easy_ocr(back_bytes)
+    except UnreadableImageError as e:
+        warning_msg = (
+            f"Back image could not be read ({str(e)}). Returning front-side "
+            f"data only — address fields may be missing or incomplete."
+        )
+        logger.warning(warning_msg)
+        warnings.append(warning_msg)
+
+    # Call Google GenAI Client
+    try:
+        client = genai.Client(api_key=api_key)
+
+        back_section = (
+            f"=== RAW OCR TEXT FROM NID BACK ===\n{back_text}"
+            if back_text
+            else "=== RAW OCR TEXT FROM NID BACK ===\n(Not available — the back image could not be read. "
+                 "Leave presentAddress and permanentAddress as empty strings rather than guessing.)"
+        )
+
+        prompt = f"""
+You are an expert Bangladeshi National Identity (NID) card parser.
+Below is the raw, noisy OCR text extracted from the front and back of a Bangladeshi NID card using EasyOCR.
+
+=== RAW OCR TEXT FROM NID FRONT ===
+{front_text}
+
+{back_section}
+
+Your task:
+1. Parse this text to find the owner's Name, Father's Name, Mother's Name, Date of Birth, NID Number, Present Address, and Permanent Address.
+2. The front card has a "Name" field printed in English (labeled "Name") and Bangla (labeled "নাম"). Use the English Name printed on the card directly for the 'name' field. Do NOT phonetically transliterate the Bangla name if the English one is available in the text.
+3. The fields "Father's Name" (পিতা) and "Mother's Name" (মাতা) are written in Bangla. Perform phonetic transliteration from Bangla to English for these fields (e.g. "স্বপন পোদ্дар" -> "Swapan Podder", "আব্দুল করিম" -> "Abdul Karim").
+4. Address fields — read this carefully, these are two DIFFERENT pieces of text on the card, never the same line:
+   - 'presentAddress' comes from the field labeled "Present Address" or "বর্তমান ঠিকানা".
+   - 'permanentAddress' comes from a field labeled "Place of Birth".
+   - Both must be transliterated Bangla-to-English the same way as names. Note: Before translitterating, remove "বাসা/হোল্ডিং:" or similar from the start of the present address, as it is not part of the actual address.
+   - Under NO circumstances copy the Present Address text into permanentAddress. They come from separate lines in the OCR text. If you genuinely cannot find distinct source text for permanentAddress (no Place of Birth label), return an empty string for it — do not fall back to reusing presentAddress.
+5. The Date of Birth (labeled "Date of Birth") and NID Number (labeled "NID No") are already printed in English digits. Extract and format them (Date of Birth in YYYY-MM-DD format, NID Number with digits only, no spaces or hyphens).
+6. Clean up any OCR spelling typos in the names or address structures to make them look professional.
+7. If a field's source text is unavailable or you cannot confidently determine it, return an empty string for that field rather than guessing.
+"""
+        model_name = "gemini-3.1-flash-lite"
+        logger.info(f"Calling Gemini model ({model_name}) for structuring & transliteration...")
+        
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=NIDDetails
+            )
+        )
+
+        extracted_data_dict = json.loads(response.text)
+        details = NIDDetails(**extracted_data_dict)
+
+        # --- MANDATORY IDENTITY FIELD VALIDATION ---
+        mandatory_fields = ["name", "fatherName", "motherName", "dateOfBirth", "nidNumber"]
+        for field in mandatory_fields:
+            val = getattr(details, field)
+            if val is None or str(val).strip() == "":
+                logger.error(f"Validation failed. Mandatory field '{field}' was returned as empty or None.")
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="IMAGE_ERROR: The core information on the NID could not be parsed securely. Please upload a clearer image."
+                )
+        # -------------------------------------------
+
+    except HTTPException:
+        # Re-raise explicit field validation errors directly 
+        raise
+
+    except errors.APIError as e:
+        if e.code == 429:
+            logger.error(f"Gemini API quota/rate limit exceeded: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Gemini API rate limit or quota exceeded. Please wait a moment and try again."
+            )
+        elif e.code == 503:
+            logger.error(f"Gemini API currently unavailable (high demand): {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="The AI model is currently experiencing high demand and is temporarily unavailable. Please try again in a few moments."
+            )
+        elif e.code in (401, 403):
+            logger.error(f"Gemini API key rejected: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid Gemini API Key. Please check the key in the sidebar (or the server's GEMINI_API_KEY) and try again."
+            )
+        elif e.code == 400:
+            if "api key" in str(e.message).lower() or "api key" in str(e).lower():
+                logger.error(f"Gemini API key rejected: {str(e)}")
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid Gemini API Key. Please check the key in the sidebar (or the server's GEMINI_API_KEY) and try again."
+                )
+            logger.error(f"Gemini processing failed: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="IMAGE_ERROR: Please provide a clear Front and Back Image."
+            )
+        else:
+            logger.error(f"Gemini processing failed: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="IMAGE_ERROR: Please provide a clear Front and Back Image."
+            )
+
+    except Exception as e:
+        logger.error(f"Gemini processing failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="IMAGE_ERROR: Please provide a clear Front and Back Image."
+        )
+
+    # Check for duplicates strictly against the NID number
+    existing_record = check_duplicate(details.nidNumber)
+
+    if existing_record:
+        logger.info(f"Duplicate found strictly for NID: {details.nidNumber}")
+        
+        # Safe structural dictionary parsing with default fallbacks
+        existing_data = NIDDetails(
+            name=existing_record.get("name", ""),
+            fatherName=existing_record.get("fatherName", ""),
+            motherName=existing_record.get("motherName", ""),
+            dateOfBirth=existing_record.get("dateOfBirth", ""),
+            nidNumber=existing_record.get("nidNumber", ""),
+            presentAddress=existing_record.get("presentAddress", ""),
+            permanentAddress=existing_record.get("permanentAddress", "")
+        )
+        return ExtractionResponse(
+            data=details,
+            already_processed=True,
+            existing_data=existing_data,
+            front_raw_text=front_text,
+            back_raw_text=back_text,
+            message="This NID is already in the database. Review the newly extracted data below and choose whether to update the existing record.",
+            warnings=warnings
+        )
+    else:
+        details_dict = details.model_dump()
+        save_to_db(details_dict)
+        success_message = (
+            "NID front-side information processed and saved successfully. "
+            "Back-side fields (address) are incomplete — see warnings below."
+            if warnings else
+            "NID information processed and saved successfully."
+        )
+        return ExtractionResponse(
+            data=details,
+            already_processed=False,
+            existing_data=None,
+            front_raw_text=front_text,
+            back_raw_text=back_text,
+            message=success_message,
+            warnings=warnings
+        )

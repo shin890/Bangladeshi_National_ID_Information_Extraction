@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+streamlit
+easyocr
+google-genai
+dotenv
