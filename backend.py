@@ -4,11 +4,11 @@ import json
 import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-
+import cv2
 import easyocr
 import numpy as np
 from PIL import Image
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, ValidationError
 
 # Upgraded to google-genai
 from google import genai
@@ -54,8 +54,19 @@ class NIDDetails(BaseModel):
     motherName: str = Field(description="English transliterated mother's name from Bangla")
     dateOfBirth: str = Field(description="Date of birth in YYYY-MM-DD format")
     nidNumber: str = Field(description="National ID number (digits only, remove all spaces/hyphens)")
-    presentAddress: str = Field(description="English transliterated present address from Bangla (labeled 'Present Address' / বর্তমান ঠিকানা)")
-    permanentAddress: str = Field(description="English transliterated permanent address from Bangla. Sourced from a field labeled 'Permanent Address'/স্থায়ী ঠিকানা if present; many NID cards instead print 'Place of Birth'/জন্মস্থান, which should be used here in that case. Must NEVER be a copy of presentAddress — if no distinct source text exists, return an empty string.")
+    presentAddress: str = Field(description="English transliterated present address from Bangla (labeled 'ঠিকানা)")
+    permanentAddress: str = Field(description="English transliterated permanent address from Bangla. Sourced from a field labeled 'Place of Birth'. Must NEVER be a copy of presentAddress field — if no distinct source text exists, return an empty string.")
+
+    @field_validator("nidNumber")
+    @classmethod
+    def validate_nid_length(cls, v: str) -> str:
+        # Sanitize any accidental spaces or hyphens just in case
+        clean_v = v.replace(" ", "").replace("-", "").strip()
+        
+        # Enforce exact Bangladeshi NID length standards (Old = 10 or 13, Smart Card = 17)
+        if len(clean_v) not in (10, 13, 17):
+            raise ValueError(f"NID number has an invalid length ({len(clean_v)} digits). It must be exactly 10, 13, or 17 digits.")
+        return clean_v
 
 # Response schema
 class ExtractionResponse(BaseModel):
@@ -104,13 +115,36 @@ def validate_image_format(file: UploadFile, label: str) -> None:
             )
         )
 
+def image_preprocessing(image_bytes: bytes) -> bytes:
+    """
+    Decodes image bytes, applies Grayscale and CLAHE processing via OpenCV, 
+    and re-encodes it back to bytes for downstream processing.
+    """
+    # 1. Convert raw bytes into a NumPy array format that OpenCV understands
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    
+    if img is None:
+        raise UnreadableImageError("OpenCV failed to decode the raw image bytes.")
+        
+    # 2. Apply your image enhancement pipeline
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    clahe_img = clahe.apply(gray)
+    
+    # 3. Re-encode the processed frame back into JPEG bytes
+    success, encoded_img = cv2.imencode(".jpg", clahe_img)
+    if not success:
+        raise UnreadableImageError("Failed to re-encode processed image matrix to bytes.")
+        
+    return encoded_img.tobytes()
 
 def get_ocr_reader():
     """Lazy load EasyOCR reader to save memory and startup time."""
     global ocr_reader
     if ocr_reader is None:
         logger.info("Initializing EasyOCR reader for Bangla and English...")
-        ocr_reader = easyocr.Reader(["bn", "en"])
+        ocr_reader = easyocr.Reader(["en", "bn"], gpu=False)  # Set gpu=True if GPU is available
         logger.info("EasyOCR initialized successfully.")
     return ocr_reader
 
@@ -193,6 +227,26 @@ def update_record(nid_number: str, new_data: Dict[str, Any]) -> Dict[str, Any]:
             return updated_record
     raise ValueError(f"No existing record found for NID '{nid_number}' to update.")
 
+def delete_record(nid_number: str) -> bool:
+    """
+    Filter out and remove a record from the JSON database file strictly by NID Number.
+    """
+    db = load_db()
+    clean_nid = nid_number.strip()
+    initial_length = len(db)
+    
+    # Rebuild the list, excluding the target NID number
+    db = [record for record in db if str(record.get("nidNumber", "")).strip() != clean_nid]
+    
+    # If the list shrank, it means we successfully found and removed the entry
+    if len(db) < initial_length:
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=4)
+        logger.info(f"Successfully deleted record for NID: {nid_number}.")
+        return True
+        
+    return False
+
 @app.get("/api/history", response_model=List[Dict[str, Any]])
 def get_history():
     """Retrieve history of processed NIDs."""
@@ -210,6 +264,27 @@ def update_nid_record(payload: UpdateRequest):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     return UpdateResponse(message="Record updated successfully.", data=NIDDetails(**updated))
 
+@app.delete("/api/delete/{nid_number}")
+def delete_nid_record(nid_number: str):
+    """
+    Endpoint to erase an existing database record using its NID string.
+    """
+    try:
+        if delete_record(nid_number):
+            return {"message": "Record deleted successfully."}
+        
+        # Fallback if the user passes an NID that isn't actually in our JSON database
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail=f"No record matching NID '{nid_number}' exists in the history database."
+        )
+    except Exception as e:
+        logger.error(f"Failed to execute database deletion block: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server database error during deletion."
+        )
+        
 @app.post("/api/extract", response_model=ExtractionResponse)
 async def extract_nid_info(
     front_image: UploadFile = File(None),
@@ -240,6 +315,22 @@ async def extract_nid_info(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Error reading uploaded images: {str(e)}"
+        )
+
+    # 2. Apply the updated image preprocessing directly to the bytes!
+    try:
+        front_bytes = image_preprocessing(front_bytes)
+        # Only process back image bytes if they exist and don't match placeholders
+        if back_bytes:
+            try:
+                back_bytes = image_preprocessing(back_bytes)
+            except Exception as ocr_err:
+                # If the optional back image processing fails, let it fallback gracefully
+                logger.warning(f"Back image preprocessing failed: {str(ocr_err)}")
+    except UnreadableImageError as preprocess_err:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"Image enhancement preprocessing failed: {str(preprocess_err)}"
         )
 
     warnings: List[str] = []
@@ -289,15 +380,16 @@ Below is the raw, noisy OCR text extracted from the front and back of a Banglade
 
 Your task:
 1. Parse this text to find the owner's Name, Father's Name, Mother's Name, Date of Birth, NID Number, Present Address, and Permanent Address.
-2. The front card has a "Name" field printed in English (labeled "Name") and Bangla (labeled "নাম"). Use the English Name printed on the card directly for the 'name' field. Do NOT phonetically transliterate the Bangla name if the English one is available in the text.
-3. The fields "Father's Name" (পিতা) and "Mother's Name" (মাতা) are written in Bangla. Perform phonetic transliteration from Bangla to English for these fields (e.g. "স্বপন পোদ্дар" -> "Swapan Podder", "আব্দুল করিম" -> "Abdul Karim").
+2. The NID FRONT has a "Name" field printed in English (labeled "Name") and Bangla (labeled "নাম"). No need to use the Bangla version. Name may contain Block Letters but ensure Title Case capitalization (e.g. "SWAPAN PODDER" -> "Swapan Podder").
+3. The fields "Father's Name" (পিতা) and "Mother's Name" (মাতা) are written in Bangla. Perform phonetic transliteration from Bangla to English for these fields (e.g. "স্বপন পোদ্দার" -> "Swapan Podder", "আব্দুল করিম" -> "Abdul Karim").
 4. Address fields — read this carefully, these are two DIFFERENT pieces of text on the card, never the same line:
-   - 'presentAddress' comes from the field labeled "Present Address" or "বর্তমান ঠিকানা".
-   - 'permanentAddress' comes from a field labeled "Place of Birth".
-   - Both must be transliterated Bangla-to-English the same way as names. Note: Before translitterating, remove "বাসা/হোল্ডিং:" or similar from the start of the present address, as it is not part of the actual address.
+   - 'presentAddress' comes from the field labeled "ঠিকানা".
+   - 'permanentAddress' comes from a field labeled "Place of Birth" or "জন্মস্থান"।
+   - 'presentAddress' must be transliterated Bangla-to-English the same way as names. Note: Before translitterating, remove "বাসা/হোল্ডিং:" or similar from the start of the present address if exist, as it is not part of the actual address.
+   - If "জন্মস্থান" in the OCR text, then phonetic transliteration is required for permanentAddress as well. 'Place of Birth' in OCR text is always in English, so no transliteration is needed for that.
    - Under NO circumstances copy the Present Address text into permanentAddress. They come from separate lines in the OCR text. If you genuinely cannot find distinct source text for permanentAddress (no Place of Birth label), return an empty string for it — do not fall back to reusing presentAddress.
-5. The Date of Birth (labeled "Date of Birth") and NID Number (labeled "NID No") are already printed in English digits. Extract and format them (Date of Birth in YYYY-MM-DD format, NID Number with digits only, no spaces or hyphens).
-6. Clean up any OCR spelling typos in the names or address structures to make them look professional.
+5. The Date of Birth (labeled "Date of Birth") and NID Number (labeled "NID No" or "ID NO.") are already printed in English digits. Extract and format them (Date of Birth in YYYY-MM-DD format, NID Number with digits only, no spaces or hyphens).
+6. Clean up any OCR spelling typos, fix word merges, split jammed text blocks, and apply standard Title Case capitalization to names and address structures to make them look professional.
 7. If a field's source text is unavailable or you cannot confidently determine it, return an empty string for that field rather than guessing.
 """
         model_name = "gemini-3.1-flash-lite"
@@ -330,6 +422,15 @@ Your task:
     except HTTPException:
         # Re-raise explicit field validation errors directly 
         raise
+
+    except ValidationError as e:
+        # Extract the exact string message from our Pydantic validator
+        error_msg = e.errors()[0]["msg"]
+        logger.error(f"Pydantic Validation failed: {error_msg}")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"NID Validation Error: {error_msg}"
+        )
 
     except errors.APIError as e:
         if e.code == 429:
@@ -419,3 +520,4 @@ Your task:
             message=success_message,
             warnings=warnings
         )
+

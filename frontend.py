@@ -260,7 +260,7 @@ with tab1:
                 <div class="card-value">{details['presentAddress']}</div>
             </div>
             <div class="info-card">
-                <div class="card-label">Permanent Address (Transliterated)</div>
+                <div class="card-label">Permanent Address (English)</div>
                 <div class="card-value">{details['permanentAddress']}</div>
             </div>
             """, unsafe_allow_html=True)
@@ -283,8 +283,7 @@ with tab1:
                             f"{API_URL}/api/update",
                             json={
                                 "nidNumber": existing_data["nidNumber"],
-                                "name": existing_data["name"],
-                                "updatedData": data,
+                                "updatedData": data
                             },
                         )
                         if update_resp.status_code == 200:
@@ -366,6 +365,31 @@ with tab2:
                         st.markdown("---")
                         formatted_rec = json.dumps(record, indent=4)
                         st.code(formatted_rec, language="json")
+
+                        delete_btn = st.button(
+                            f"🗑️ Delete Record for {record['name']}", 
+                            key=f"del_{record['nidNumber']}_{idx}", 
+                            type="secondary",
+                            use_container_width=True
+                        )
+                        
+                        if delete_btn:
+                            try:
+                                # Execute the HTTP Delete call straight to our updated backend route
+                                del_resp = requests.delete(f"{API_URL}/api/delete/{record['nidNumber']}")
+                                
+                                if del_resp.status_code == 200:
+                                    st.success("✅ Record successfully purged from database.")
+                                    # Force Streamlit to instantly redraw the interface, dropping the card out of view
+                                    st.rerun()
+                                else:
+                                    err_msg = del_resp.json().get("detail", "Unknown routing error")
+                                    st.error(f"❌ Deletion failed: {err_msg}")
+                                    
+                            except requests.exceptions.ConnectionError:
+                                st.error("🔌 Network Error: Unable to communicate with the FastAPI backend server.")
+
+                        
                         
         else:
             st.error("Failed to load history from backend.")

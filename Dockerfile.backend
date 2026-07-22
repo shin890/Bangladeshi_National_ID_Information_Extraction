@@ -1,0 +1,17 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+COPY requirements_backend.txt .
+RUN pip install --no-cache-dir -r requirements_backend.txt
+
+# Pre-download the EasyOCR English and Bangla models into the image layer
+RUN python -c "import easyocr; easyocr.Reader(['bn', 'en'])"
+
+# Copy the backend code into the container workspace
+COPY backend.py .
+
+# Expose the internal FastAPI server port
+EXPOSE 8000
+
+CMD ["uvicorn", "backend:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,15 @@
+__pycache__
+.venv
+.env
+.dockerignore
+.git
+.gitignore
+.vscode
+**/docker-compose*
+**/compose.y*ml
+Dockerfile*
+LICENSE
+README.md
+*ImageSample.jpg
+run.py
+data

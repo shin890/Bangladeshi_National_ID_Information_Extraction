@@ -1,0 +1,16 @@
+fastapi
+python-multipart
+uvicorn
+
+#For GPU-enabled PyTorch installation, uncomment the following lines and comment out the CPU-only lines above
+# torch
+# torchvision
+
+# For CPU-only PyTorch installation
+torch --extra-index-url https://download.pytorch.org/whl/cpu
+torchvision --extra-index-url https://download.pytorch.org/whl/cpu
+
+easyocr
+opencv-python-headless
+google-genai
+python-dotenv

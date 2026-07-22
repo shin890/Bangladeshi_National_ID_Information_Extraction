@@ -1,6 +1,8 @@
 __pycache__
 .env
 .vscode
-
-BackImageSample.jpg
-FrontImageSample.jpg
+myenv
+*ImageSample.jpg
+run.py
+data
+test.py
