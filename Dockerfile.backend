@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
@@ -6,7 +6,7 @@ COPY requirements_backend.txt .
 RUN pip install --no-cache-dir -r requirements_backend.txt
 
 # Pre-download the EasyOCR English and Bangla models into the image layer
-RUN python -c "import easyocr; easyocr.Reader(['bn', 'en'])"
+RUN python -c "import easyocr; easyocr.Reader(['en', 'bn'])"
 
 # Copy the backend code into the container workspace
 COPY backend.py .

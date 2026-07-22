@@ -144,7 +144,7 @@ def get_ocr_reader():
     global ocr_reader
     if ocr_reader is None:
         logger.info("Initializing EasyOCR reader for Bangla and English...")
-        ocr_reader = easyocr.Reader(["en", "bn"], gpu=False)  # Set gpu=True if GPU is available
+        ocr_reader = easyocr.Reader(["en", "bn"])  # Set gpu=True if GPU is available
         logger.info("EasyOCR initialized successfully.")
     return ocr_reader
 
