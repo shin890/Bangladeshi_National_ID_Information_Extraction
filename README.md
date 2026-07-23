@@ -22,48 +22,8 @@ The system combines computer vision image preprocessing (OpenCV CLAHE), offline 
 
 ### 3. System Architecture & Pipeline
 
-```
-                       ┌─────────────────────────────────────────┐
-                       │           Streamlit Web UI              │
-                       │           (Port 8501)                   │
-                       └──────────────────┬──────────────────────┘
-                                          │ HTTP POST (Multipart Image Files)
-                                          ▼
-                       ┌─────────────────────────────────────────┐
-                       │           FastAPI REST API              │
-                       │           (Port 8000)                   │
-                       └──────────────────┬──────────────────────┘
-                                          │
-                                          ▼
-                       ┌─────────────────────────────────────────┐
-                       │     OpenCV Preprocessing Engine         │
-                       │     (Grayscale + CLAHE Enhancement)     │
-                       └──────────────────┬──────────────────────┘
-                                          │
-                                          ▼
-                       ┌─────────────────────────────────────────┐
-                       │       Local EasyOCR Engine              │
-                       │     (Bangla + English Text Bounds)      │
-                       └──────────────────┬──────────────────────┘
-                                          │
-                                          ▼
-                       ┌─────────────────────────────────────────┐
-                       │      Google Gemini AI Engine            │
-                       │ (Structured Schema & Transliteration)   │
-                       └──────────────────┬──────────────────────┘
-                                          │
-                                          ▼
-                       ┌─────────────────────────────────────────┐
-                       │      Pydantic Data Sanitization         │
-                       │      (NID Digits & Field Checks)        │
-                       └──────────────────┬──────────────────────┘
-                                          │
-                                          ▼
-                       ┌─────────────────────────────────────────┐
-                       │       Persistent JSON Database          │
-                       │      (data/processed_nids.json)         │
-                       └─────────────────────────────────────────┘
-```
+![System Architecture](architecture.png)
+*End-to-end system architecture and pipeline for Bangladeshi NID information extraction.*
 
 ---
 
