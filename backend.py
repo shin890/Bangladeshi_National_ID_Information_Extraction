@@ -382,10 +382,10 @@ Your task:
 1. Parse this text to find the owner's Name, Father's Name, Mother's Name, Date of Birth, NID Number, Present Address, and Permanent Address.
 2. The NID FRONT has a "Name" field printed in English (labeled "Name") and Bangla (labeled "নাম"). No need to use the Bangla version. Name may contain Block Letters but ensure Title Case capitalization (e.g. "SWAPAN PODDER" -> "Swapan Podder").
 3. The fields "Father's Name" (পিতা) and "Mother's Name" (মাতা) are written in Bangla. Perform phonetic transliteration from Bangla to English for these fields (e.g. "স্বপন পোদ্দার" -> "Swapan Podder", "আব্দুল করিম" -> "Abdul Karim").
-4. Address fields — read this carefully, these are two DIFFERENT pieces of text on the card, never the same line:
+4. Address fields - read this carefully, these are two DIFFERENT pieces of text on the card, never the same line:
    - 'presentAddress' comes from the field labeled "ঠিকানা".
    - 'permanentAddress' comes from a field labeled "Place of Birth" or "জন্মস্থান"।
-   - 'presentAddress' must be transliterated Bangla-to-English the same way as names. Note: Before translitterating, remove "বাসা/হোল্ডিং:" or similar from the start of the present address if exist, as it is not part of the actual address.
+   - 'presentAddress' must be transliterated Bangla-to-English the same way as names.
    - If "জন্মস্থান" in the OCR text, then phonetic transliteration is required for permanentAddress as well. 'Place of Birth' in OCR text is always in English, so no transliteration is needed for that.
    - Under NO circumstances copy the Present Address text into permanentAddress. They come from separate lines in the OCR text. If you genuinely cannot find distinct source text for permanentAddress (no Place of Birth label), return an empty string for it — do not fall back to reusing presentAddress.
 5. The Date of Birth (labeled "Date of Birth") and NID Number (labeled "NID No" or "ID NO.") are already printed in English digits. Extract and format them (Date of Birth in YYYY-MM-DD format, NID Number with digits only, no spaces or hyphens).
